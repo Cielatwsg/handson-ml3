@@ -1,0 +1,172 @@
+{
+  "name": "OOH Care Demand Forecast Pipeline",
+  "description": "6-month demand forecasting for Out-of-Home care using 5 models + evaluation",
+  "email_notifications": {
+    "on_failure": ["your-team@example.com"],
+    "no_alert_for_skipped_runs": true
+  },
+  "tags": {
+    "team": "data-science",
+    "domain": "social-care",
+    "project": "ooh-demand-forecast"
+  },
+  "tasks": [
+    {
+      "task_key": "data_setup",
+      "description": "Generate synthetic OOH care data and create Delta tables",
+      "notebook_task": {
+        "notebook_path": "/Repos/your-repo/forecast_notebooks/00_data_setup",
+        "base_parameters": {
+          "catalog": "hive_metastore",
+          "schema": "demand_forecast",
+          "table": "ooh_care_monthly",
+          "seed": "42"
+        }
+      },
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 2
+      }
+    },
+    {
+      "task_key": "forecast_01_baseline",
+      "description": "Baseline: Seasonal Naïve / Moving Average / Holt-Winters",
+      "depends_on": [{ "task_key": "data_setup" }],
+      "notebook_task": {
+        "notebook_path": "/Repos/your-repo/forecast_notebooks/01_baseline_forecast",
+        "base_parameters": {
+          "catalog": "hive_metastore",
+          "schema": "demand_forecast",
+          "experiment": "/Shared/ooh_care_demand_forecast",
+          "horizon": "6"
+        }
+      },
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 2
+      }
+    },
+    {
+      "task_key": "forecast_02_sarima",
+      "description": "SARIMA — distributed via applyInPandas",
+      "depends_on": [{ "task_key": "data_setup" }],
+      "notebook_task": {
+        "notebook_path": "/Repos/your-repo/forecast_notebooks/02_sarima_forecast",
+        "base_parameters": {
+          "catalog": "hive_metastore",
+          "schema": "demand_forecast",
+          "experiment": "/Shared/ooh_care_demand_forecast",
+          "horizon": "6"
+        }
+      },
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.2xlarge",
+        "num_workers": 4,
+        "spark_conf": { "spark.sql.shuffle.partitions": "25" }
+      }
+    },
+    {
+      "task_key": "forecast_03_simple_rnn",
+      "description": "Simple RNN (Chapter 15) — global model",
+      "depends_on": [{ "task_key": "data_setup" }],
+      "notebook_task": {
+        "notebook_path": "/Repos/your-repo/forecast_notebooks/03_simple_rnn_forecast",
+        "base_parameters": {
+          "catalog": "hive_metastore",
+          "schema": "demand_forecast",
+          "experiment": "/Shared/ooh_care_demand_forecast",
+          "horizon": "6",
+          "window": "18",
+          "epochs": "200",
+          "batch_size": "32"
+        }
+      },
+      "new_cluster": {
+        "spark_version": "14.3.x-gpu-ml-scala2.12",
+        "node_type_id": "g4dn.xlarge",
+        "num_workers": 0,
+        "driver_node_type_id": "g4dn.xlarge"
+      }
+    },
+    {
+      "task_key": "forecast_04_lstm",
+      "description": "Stacked LSTM (Chapter 15) — global model with multivariate features",
+      "depends_on": [{ "task_key": "data_setup" }],
+      "notebook_task": {
+        "notebook_path": "/Repos/your-repo/forecast_notebooks/04_lstm_forecast",
+        "base_parameters": {
+          "catalog": "hive_metastore",
+          "schema": "demand_forecast",
+          "experiment": "/Shared/ooh_care_demand_forecast",
+          "horizon": "6",
+          "window": "18",
+          "epochs": "300",
+          "batch_size": "32"
+        }
+      },
+      "new_cluster": {
+        "spark_version": "14.3.x-gpu-ml-scala2.12",
+        "node_type_id": "g4dn.xlarge",
+        "num_workers": 0,
+        "driver_node_type_id": "g4dn.xlarge"
+      }
+    },
+    {
+      "task_key": "forecast_05_cnn_wavenet",
+      "description": "CNN WaveNet + LSTM (Chapter 15) — dilated causal convolutions",
+      "depends_on": [{ "task_key": "data_setup" }],
+      "notebook_task": {
+        "notebook_path": "/Repos/your-repo/forecast_notebooks/05_cnn_wavenet_forecast",
+        "base_parameters": {
+          "catalog": "hive_metastore",
+          "schema": "demand_forecast",
+          "experiment": "/Shared/ooh_care_demand_forecast",
+          "horizon": "6",
+          "window": "24",
+          "epochs": "300",
+          "batch_size": "32",
+          "n_filters": "64"
+        }
+      },
+      "new_cluster": {
+        "spark_version": "14.3.x-gpu-ml-scala2.12",
+        "node_type_id": "g4dn.xlarge",
+        "num_workers": 0,
+        "driver_node_type_id": "g4dn.xlarge"
+      }
+    },
+    {
+      "task_key": "evaluation",
+      "description": "Compare all 5 models and declare a winner",
+      "depends_on": [
+        { "task_key": "forecast_01_baseline" },
+        { "task_key": "forecast_02_sarima" },
+        { "task_key": "forecast_03_simple_rnn" },
+        { "task_key": "forecast_04_lstm" },
+        { "task_key": "forecast_05_cnn_wavenet" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/your-repo/forecast_notebooks/06_evaluation",
+        "base_parameters": {
+          "catalog": "hive_metastore",
+          "schema": "demand_forecast",
+          "experiment": "/Shared/ooh_care_demand_forecast"
+        }
+      },
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 2
+      }
+    }
+  ],
+  "schedule": {
+    "quartz_cron_expression": "0 0 1 1 * ?",
+    "timezone_id": "Europe/London",
+    "pause_status": "PAUSED"
+  },
+  "max_concurrent_runs": 1
+}
