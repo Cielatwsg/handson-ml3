@@ -1,6 +1,6 @@
 {
   "name": "OOH Care Demand Forecast Pipeline",
-  "description": "6-month demand forecasting for Out-of-Home care using 5 models + evaluation",
+  "description": "6-month demand forecasting for Out-of-Home care using 6 models + evaluation",
   "email_notifications": {
     "on_failure": ["your-team@example.com"],
     "no_alert_for_skipped_runs": true
@@ -39,7 +39,8 @@
           "catalog": "hive_metastore",
           "schema": "demand_forecast",
           "experiment": "/Shared/ooh_care_demand_forecast",
-          "horizon": "6"
+          "horizon": "6",
+          "seed": "42"
         }
       },
       "new_cluster": {
@@ -58,7 +59,8 @@
           "catalog": "hive_metastore",
           "schema": "demand_forecast",
           "experiment": "/Shared/ooh_care_demand_forecast",
-          "horizon": "6"
+          "horizon": "6",
+          "seed": "42"
         }
       },
       "new_cluster": {
@@ -139,17 +141,42 @@
       }
     },
     {
+      "task_key": "forecast_06_prophet",
+      "description": "Prophet (Meta) — multiplicative seasonality + population regressor",
+      "depends_on": [{ "task_key": "data_setup" }],
+      "notebook_task": {
+        "notebook_path": "/Repos/your-repo/forecast_notebooks/06_prophet_forecast",
+        "base_parameters": {
+          "catalog": "hive_metastore",
+          "schema": "demand_forecast",
+          "experiment": "/Shared/ooh_care_demand_forecast",
+          "horizon": "6",
+          "changepoint_prior": "0.1",
+          "seasonality_prior": "10.0",
+          "uncertainty_samples": "1000",
+          "seed": "42"
+        }
+      },
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.2xlarge",
+        "num_workers": 4,
+        "spark_conf": { "spark.sql.shuffle.partitions": "25" }
+      }
+    },
+    {
       "task_key": "evaluation",
-      "description": "Compare all 5 models and declare a winner",
+      "description": "Compare all 6 models and declare a winner",
       "depends_on": [
         { "task_key": "forecast_01_baseline" },
         { "task_key": "forecast_02_sarima" },
         { "task_key": "forecast_03_simple_rnn" },
         { "task_key": "forecast_04_lstm" },
-        { "task_key": "forecast_05_cnn_wavenet" }
+        { "task_key": "forecast_05_cnn_wavenet" },
+        { "task_key": "forecast_06_prophet" }
       ],
       "notebook_task": {
-        "notebook_path": "/Repos/your-repo/forecast_notebooks/06_evaluation",
+        "notebook_path": "/Repos/your-repo/forecast_notebooks/07_evaluation",
         "base_parameters": {
           "catalog": "hive_metastore",
           "schema": "demand_forecast",

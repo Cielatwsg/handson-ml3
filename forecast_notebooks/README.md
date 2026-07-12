@@ -18,7 +18,8 @@ Inspired by **Chapter 15: Processing Sequences Using RNNs and CNNs**
 | `03_simple_rnn_forecast.py` | Simple RNN (Ch15 §"Using a Simple RNN") | ★★★☆☆ | TensorFlow/Keras |
 | `04_lstm_forecast.py` | Stacked LSTM + multivariate features (Ch15 §"LSTMs") | ★★★★☆ | TensorFlow/Keras |
 | `05_cnn_wavenet_forecast.py` | WaveNet-style dilated Conv1D + LSTM (Ch15 §"WaveNet") | ★★★★★ | TensorFlow/Keras |
-| `06_evaluation.py` | Cross-model evaluation & ranking | Final | MLflow / seaborn |
+| `06_prophet_forecast.py` | Prophet — multiplicative decomposition + changepoints | ★★★☆☆ | prophet |
+| `07_evaluation.py` | Cross-model evaluation & ranking (all 6 models) | Final | MLflow / seaborn |
 
 ---
 
@@ -89,8 +90,8 @@ Jan 2021 ──────────────────── Jun 2023 �
 
 1. Upload all `.py` files to Databricks Workspace (or push via Repos)
 2. Run `00_data_setup` first
-3. Run `01` through `05` in any order (they are independent)
-4. Run `06_evaluation` last
+3. Run `01` through `06` in any order (they are independent of each other)
+4. Run `07_evaluation` last
 
 ### Option 2 — Databricks Job (recommended)
 
@@ -104,15 +105,16 @@ The DAG is:
 ```
 00_data_setup
      │
-     ├── 01_baseline   ─┐
-     ├── 02_sarima     ─┤
-     ├── 03_simple_rnn ─┼──► 06_evaluation
-     ├── 04_lstm       ─┤
-     └── 05_cnn_wavenet─┘
+     ├── 01_baseline    ─┐
+     ├── 02_sarima      ─┤
+     ├── 03_simple_rnn  ─┼──► 07_evaluation
+     ├── 04_lstm        ─┤
+     ├── 05_cnn_wavenet ─┤
+     └── 06_prophet     ─┘
 ```
 
-Notebooks 01–05 run **in parallel** after data setup, then the evaluation
-runs once all five have finished.
+Notebooks 01–06 run **in parallel** after data setup, then the evaluation
+runs once all six have finished.
 
 ### Parameters (all notebooks accept Databricks Job widgets)
 
@@ -122,6 +124,7 @@ runs once all five have finished.
 | `schema` | `demand_forecast` | Database / schema |
 | `experiment` | `/Shared/ooh_care_demand_forecast` | MLflow experiment path |
 | `horizon` | `6` | Forecast horizon in months |
+| `seed` | `42` | Global random seed — set identically across all notebooks for reproducibility |
 
 ---
 
@@ -137,6 +140,25 @@ runs once all five have finished.
 | WaveNet dilated causal convolutions | 05 |
 | Multi-step forecasting (direct strategy) | 03, 04, 05 |
 | Multivariate time series | 04, 05 |
+
+## Reproducibility
+
+All notebooks accept a `seed` widget (default `42`). The seed is applied at every level:
+
+| Level | Call |
+|---|---|
+| Python builtins | `random.seed(SEED)` |
+| Python hash | `os.environ["PYTHONHASHSEED"] = str(SEED)` |
+| NumPy | `np.random.seed(SEED)` |
+| TensorFlow (notebooks 03–05) | `tf.random.set_seed(SEED)` |
+| TF GPU ops (notebooks 03–05) | `os.environ["TF_DETERMINISTIC_OPS"] = "1"` |
+| cuDNN (notebooks 03–05) | `os.environ["TF_CUDNN_DETERMINISTIC"] = "1"` |
+| Prophet (notebook 06) | `np.random.seed(SEED)` before each `fit()` call |
+
+> **Note**: Full bit-for-bit reproducibility in TensorFlow on GPUs is only guaranteed when
+> `TF_DETERMINISTIC_OPS=1` is set *before* the TF runtime is initialised (i.e., before
+> any `import tensorflow` call). Setting it in the same cell as the import is sufficient
+> in Databricks notebook environments.
 
 ---
 

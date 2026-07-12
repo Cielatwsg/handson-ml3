@@ -47,6 +47,7 @@ dbutils.widgets.text("window",      "24", "Lookback window (months)")
 dbutils.widgets.text("epochs",      "300","Max training epochs")
 dbutils.widgets.text("batch_size",  "32", "Mini-batch size")
 dbutils.widgets.text("n_filters",   "64", "Conv1D filters per layer")
+dbutils.widgets.text("seed",        "42", "Global random seed for reproducibility")
 
 CATALOG    = dbutils.widgets.get("catalog")
 SCHEMA     = dbutils.widgets.get("schema")
@@ -58,6 +59,7 @@ WINDOW     = int(dbutils.widgets.get("window"))
 EPOCHS     = int(dbutils.widgets.get("epochs"))
 BATCH_SIZE = int(dbutils.widgets.get("batch_size"))
 N_FILTERS  = int(dbutils.widgets.get("n_filters"))
+SEED       = int(dbutils.widgets.get("seed"))
 
 MODEL_NAME   = "cnn_wavenet_lstm"
 TRAIN_END    = "2023-06-01"
@@ -76,10 +78,24 @@ print(f"Dilations: {DILATIONS}  |  Window: {WINDOW}  |  Horizon: {HORIZON}")
 
 # COMMAND ----------
 
+# MAGIC %md ## 2. Reproducibility Seeds
+
+# COMMAND ----------
+
+import os, random
+os.environ["PYTHONHASHSEED"]         = str(SEED)
+os.environ["TF_DETERMINISTIC_OPS"]   = "1"
+os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
+random.seed(SEED)
+
 import numpy as np
+np.random.seed(SEED)
+
 import pandas as pd
 from datetime import datetime, timezone
 import tensorflow as tf
+tf.random.set_seed(SEED)
+
 from tensorflow import keras
 import mlflow
 import mlflow.keras
@@ -89,9 +105,8 @@ from pyspark.sql.types import (
     DateType, StringType, DoubleType, BooleanType, TimestampType
 )
 
-tf.random.set_seed(42)
-np.random.seed(42)
 print(f"TensorFlow: {tf.__version__}")
+print(f"Global seed: {SEED}")
 
 # COMMAND ----------
 
@@ -278,6 +293,7 @@ with mlflow.start_run(run_name=MODEL_NAME) as run:
         "batch_size":       BATCH_SIZE,
         "receptive_field":  1 + (KERNEL_SIZE - 1) * sum(DILATIONS),
         "train_end":        TRAIN_END,
+        "seed":             SEED,
     })
 
     history = model.fit(

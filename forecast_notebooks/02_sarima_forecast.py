@@ -28,7 +28,8 @@ dbutils.widgets.text("catalog",    "hive_metastore",   "Catalog")
 dbutils.widgets.text("schema",     "demand_forecast",  "Schema")
 dbutils.widgets.text("src_table",  "ooh_care_monthly", "Source table")
 dbutils.widgets.text("experiment", "/Shared/ooh_care_demand_forecast", "MLflow experiment")
-dbutils.widgets.text("horizon",    "6",                "Forecast horizon (months)")
+dbutils.widgets.text("horizon",    "6",  "Forecast horizon (months)")
+dbutils.widgets.text("seed",       "42", "Global random seed for reproducibility")
 
 CATALOG    = dbutils.widgets.get("catalog")
 SCHEMA     = dbutils.widgets.get("schema")
@@ -36,6 +37,7 @@ SRC_TABLE  = f"{CATALOG}.{SCHEMA}.{dbutils.widgets.get('src_table')}"
 FCST_TABLE = f"{CATALOG}.{SCHEMA}.ooh_care_forecasts"
 EXPERIMENT = dbutils.widgets.get("experiment")
 HORIZON    = int(dbutils.widgets.get("horizon"))
+SEED       = int(dbutils.widgets.get("seed"))
 
 MODEL_NAME   = "sarima"
 TRAIN_END    = "2023-06-01"
@@ -53,8 +55,18 @@ print(f"Model  : {MODEL_NAME}")
 
 # COMMAND ----------
 
+# MAGIC %md ## 2. Reproducibility Seeds
+
+# COMMAND ----------
+
+import os, random
+os.environ["PYTHONHASHSEED"] = str(SEED)
+random.seed(SEED)
+
 import warnings
 import numpy as np
+np.random.seed(SEED)   # controls pmdarima's internal optimiser initialisations
+
 import pandas as pd
 from datetime import datetime, timezone
 import pmdarima as pm
@@ -191,10 +203,11 @@ mlflow.set_experiment(EXPERIMENT)
 
 with mlflow.start_run(run_name=MODEL_NAME) as run:
     mlflow.set_tag("model_name", MODEL_NAME)
-    mlflow.log_param("method",  "SARIMA (auto_arima)")
-    mlflow.log_param("horizon", HORIZON)
+    mlflow.log_param("method",          "SARIMA (auto_arima)")
+    mlflow.log_param("horizon",         HORIZON)
     mlflow.log_param("seasonal_period", 12)
-    mlflow.log_param("train_end", TRAIN_END)
+    mlflow.log_param("train_end",       TRAIN_END)
+    mlflow.log_param("seed",            SEED)
 
     # Broadcast the run_id so executors can stamp it on each row
     _RUN_ID = run.info.run_id

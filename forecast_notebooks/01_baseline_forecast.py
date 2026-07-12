@@ -26,7 +26,8 @@ dbutils.widgets.text("catalog",     "hive_metastore",   "Catalog")
 dbutils.widgets.text("schema",      "demand_forecast",  "Schema")
 dbutils.widgets.text("src_table",   "ooh_care_monthly", "Source table")
 dbutils.widgets.text("experiment",  "/Shared/ooh_care_demand_forecast", "MLflow experiment")
-dbutils.widgets.text("horizon",     "6", "Forecast horizon (months)")
+dbutils.widgets.text("horizon",     "6",  "Forecast horizon (months)")
+dbutils.widgets.text("seed",        "42", "Global random seed for reproducibility")
 
 CATALOG    = dbutils.widgets.get("catalog")
 SCHEMA     = dbutils.widgets.get("schema")
@@ -34,6 +35,7 @@ SRC_TABLE  = f"{CATALOG}.{SCHEMA}.{dbutils.widgets.get('src_table')}"
 FCST_TABLE = f"{CATALOG}.{SCHEMA}.ooh_care_forecasts"
 EXPERIMENT = dbutils.widgets.get("experiment")
 HORIZON    = int(dbutils.widgets.get("horizon"))
+SEED       = int(dbutils.widgets.get("seed"))
 
 MODEL_NAME     = "baseline"
 TRAIN_END      = "2023-06-01"   # last training month
@@ -52,7 +54,19 @@ print(f"Model  : {MODEL_NAME}")
 
 # COMMAND ----------
 
+# MAGIC %md ## 2. Reproducibility Seeds
+# MAGIC
+# MAGIC All randomness is pinned to `SEED` so every run produces identical results.
+
+# COMMAND ----------
+
+import os, random
+os.environ["PYTHONHASHSEED"] = str(SEED)  # Python hash randomisation
+random.seed(SEED)                          # Python random module
+
 import numpy as np
+np.random.seed(SEED)                       # NumPy (used by statsmodels internals)
+
 import pandas as pd
 from datetime import datetime, timezone
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
@@ -158,9 +172,10 @@ all_forecasts = []
 
 with mlflow.start_run(run_name=MODEL_NAME) as run:
     mlflow.set_tag("model_name", MODEL_NAME)
-    mlflow.log_param("horizon", HORIZON)
-    mlflow.log_param("train_end", TRAIN_END)
+    mlflow.log_param("horizon",    HORIZON)
+    mlflow.log_param("train_end",  TRAIN_END)
     mlflow.log_param("test_start", TEST_START)
+    mlflow.log_param("seed",       SEED)
 
     series_rmse = {}
 

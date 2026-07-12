@@ -1,18 +1,19 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 06 · Evaluation — Which Model Wins?
+# MAGIC # 07 · Evaluation — Which Model Wins?
 # MAGIC
 # MAGIC This notebook is the **final step** in the Databricks Job/Pipeline.
-# MAGIC It runs after all five forecast notebooks have completed and written
+# MAGIC It runs after all **six** forecast notebooks have completed and written
 # MAGIC their results to the shared Delta table `ooh_care_forecasts`.
 # MAGIC
 # MAGIC ### What this notebook does
-# MAGIC 1. Loads actuals (Jul–Dec 2023 hold-out) and all model forecasts
-# MAGIC 2. Computes **MAE, RMSE, MAPE, sMAPE, WAPE** per model
-# MAGIC 3. Ranks models overall and **by region / care type**
-# MAGIC 4. Produces publication-ready charts (forecast overlay, error bars, heatmaps)
+# MAGIC 1. Loads actuals (Jul–Dec 2023 hold-out) and all 6 model forecasts
+# MAGIC 2. Computes **MAE, RMSE, MAPE, sMAPE, WAPE, Bias** per model
+# MAGIC 3. Ranks models overall and **by region / care type** (heatmaps)
+# MAGIC 4. Produces publication-ready charts (forecast overlay, monthly RMSE, all-series grid)
 # MAGIC 5. Logs everything to MLflow and writes a `model_ranking` Delta table
 # MAGIC 6. Prints a clear recommendation of the **winning model**
+# MAGIC 7. Registers the winning Keras model (if applicable) in the MLflow Model Registry
 
 # COMMAND ----------
 
@@ -41,6 +42,7 @@ MODEL_LABELS = {
     "simple_rnn":        "03 · Simple RNN",
     "lstm":              "04 · LSTM",
     "cnn_wavenet_lstm":  "05 · CNN-WaveNet + LSTM",
+    "prophet":           "06 · Prophet",
 }
 
 print(f"Source    : {SRC_TABLE}")
@@ -116,6 +118,10 @@ future_sdf = (
 future_sdf["period"] = pd.to_datetime(future_sdf["period"])
 
 models = sorted(eval_pdf["model_name"].unique())
+expected = set(MODEL_LABELS.keys())
+missing  = expected - set(models)
+if missing:
+    print(f"⚠️  Models not yet in forecast table (run their notebooks first): {missing}")
 print(f"Models loaded: {models}")
 print(f"Evaluation rows: {len(eval_pdf):,}")
 
@@ -250,11 +256,12 @@ print(f"Rankings written to {RANK_TABLE}")
 # COMMAND ----------
 
 COLOURS = {
-    "baseline":         "#6c757d",
-    "sarima":           "#fd7e14",
-    "simple_rnn":       "#0d6efd",
-    "lstm":             "#198754",
-    "cnn_wavenet_lstm": "#dc3545",
+    "baseline":         "#6c757d",   # grey
+    "sarima":           "#fd7e14",   # orange
+    "simple_rnn":       "#0d6efd",   # blue
+    "lstm":             "#198754",   # green
+    "cnn_wavenet_lstm": "#dc3545",   # red
+    "prophet":          "#6f42c1",   # purple
 }
 
 # ── 6.1 Overall Metrics Bar Chart ─────────────────────────────────────────
@@ -369,7 +376,9 @@ plt.show()
 # COMMAND ----------
 
 # ── 6.5 Future 6-Month Forecast (Jan–Jun 2024) — All Models ──────────────
-fig, axes = plt.subplots(N_ROWS := 5, N_COLS := 5, figsize=(20, 18), sharey=False)
+N_REGIONS_PLOT   = len(regions_list)
+N_CARETYPES_PLOT = len(care_types_list)
+fig, axes = plt.subplots(N_REGIONS_PLOT, N_CARETYPES_PLOT, figsize=(20, 18), sharey=False)
 axes = axes.flatten()
 
 regions_list    = sorted(future_sdf["region"].unique())
@@ -460,30 +469,33 @@ with mlflow.start_run(run_id=eval_run_id):
 
 # COMMAND ----------
 
-winner       = overall_metrics.iloc[0]
-runner_up    = overall_metrics.iloc[1]
-worst        = overall_metrics.iloc[-1]
-baseline_row = overall_metrics[overall_metrics["model_name"] == "baseline"].iloc[0]
+winner        = overall_metrics.iloc[0]
+runner_up     = overall_metrics.iloc[1]
+baseline_row  = overall_metrics[overall_metrics["model_name"] == "baseline"].iloc[0]
+prophet_row   = overall_metrics[overall_metrics["model_name"] == "prophet"]
+prophet_rank  = int(prophet_row["Rank"].values[0]) if len(prophet_row) > 0 else "N/A"
 
 improvement_vs_baseline = (baseline_row["RMSE"] - winner["RMSE"]) / baseline_row["RMSE"] * 100
 
 print("=" * 80)
-print("  FINAL RECOMMENDATION")
+print("  FINAL RECOMMENDATION  (6 models evaluated)")
 print("=" * 80)
-print(f"  🏆 Winner : {MODEL_LABELS.get(winner['model_name'], winner['model_name'])}")
+print(f"  Winner    : {MODEL_LABELS.get(winner['model_name'], winner['model_name'])}")
 print(f"     RMSE   : {winner['RMSE']:.2f}")
 print(f"     MAPE   : {winner['MAPE_%']:.2f}%")
 print(f"     sMAPE  : {winner['sMAPE_%']:.2f}%")
+print(f"     Bias   : {winner['Bias']:+.2f}")
 print()
 print(f"  2nd place : {MODEL_LABELS.get(runner_up['model_name'], runner_up['model_name'])}")
 print(f"     RMSE   : {runner_up['RMSE']:.2f}")
 print()
 print(f"  Improvement over Baseline (RMSE): {improvement_vs_baseline:.1f}%")
+print(f"  Prophet rank: #{prophet_rank} of {len(overall_metrics)}")
 print()
 print("  FULL RANKING:")
 for _, row in overall_metrics.iterrows():
     print(f"    #{int(row['Rank'])}  {MODEL_LABELS.get(row['model_name'], row['model_name']):<45}  "
-          f"RMSE={row['RMSE']:.2f}  MAPE={row['MAPE_%']:.1f}%")
+          f"RMSE={row['RMSE']:.2f}  MAPE={row['MAPE_%']:.1f}%  Bias={row['Bias']:+.0f}")
 print("=" * 80)
 
 # COMMAND ----------
@@ -502,22 +514,29 @@ winning_run_id = (
          .first()["mlflow_run_id"]
 )
 
-if winning_run_id and winner["model_name"] in ("lstm", "cnn_wavenet_lstm", "simple_rnn"):
+KERAS_MODELS = {"simple_rnn", "lstm", "cnn_wavenet_lstm"}
+
+if winning_run_id and winner["model_name"] in KERAS_MODELS:
     try:
         registered = mlflow.register_model(
             model_uri=f"runs:/{winning_run_id}/model",
             name="ooh_care_demand_forecast_champion",
         )
-        print(f"Registered model version: {registered.version}")
+        print(f"Keras model registered  — version: {registered.version}")
         print(f"Model name: ooh_care_demand_forecast_champion")
     except Exception as e:
         print(f"Model registry skipped (Unity Catalog may need separate setup): {e}")
+elif winner["model_name"] == "prophet":
+    print("Winner is Prophet — a per-series statistical model (no single Keras artifact).")
+    print("To serve, load each series' fitted Prophet object from the MLflow run artifacts.")
+    print(f"Winning run ID: {winning_run_id}")
 else:
-    print(f"Winner '{winner['model_name']}' is a statistical model — no Keras artifact to register.")
-    print("To deploy, use the serialised pmdarima/statsmodels objects saved as MLflow artifacts.")
+    print(f"Winner '{winner['model_name']}' uses statsmodels — no Keras artifact to register.")
+    print("The fitted model objects were logged to the MLflow run as Python artifacts.")
 
 # COMMAND ----------
 
-print("\n✅ Evaluation notebook 06 complete.")
+print("\n✅ Evaluation notebook 07 complete.")
 print(f"   View results at: {RANK_TABLE}")
 print(f"   MLflow experiment: {EXPERIMENT}")
+print(f"   Winner: {MODEL_LABELS.get(winner['model_name'], winner['model_name'])} (RMSE={winner['RMSE']:.2f})")
