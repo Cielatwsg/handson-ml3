@@ -212,6 +212,134 @@ model.summary()
 
 # COMMAND ----------
 
+# MAGIC %md ## CV · Time Series Walk-Forward Cross-Validation
+# MAGIC
+# MAGIC A **lite version** of the SimpleRNN (half the units, capped at 80 epochs) is
+# MAGIC trained independently on each fold's training windows, then evaluated on the
+# MAGIC corresponding validation windows.  This is true walk-forward CV — the lite model
+# MAGIC never sees validation data during training.
+# MAGIC
+# MAGIC With `WINDOW=18`, two folds fit within the training period:
+# MAGIC
+# MAGIC | Fold | Train period | Validation period |
+# MAGIC |---|---|---|
+# MAGIC | 1 | Jan 2021 – Jun 2022 (18 m) | Jul 2022 – Dec 2022 |
+# MAGIC | 2 | Jan 2021 – Dec 2022 (24 m) | Jan 2023 – Jun 2023 |
+# MAGIC
+# MAGIC CV RMSE gives an unbiased estimate of generalisation; the **full model** trained
+# MAGIC below uses the entire training set for the best possible final forecast.
+
+# COMMAND ----------
+
+CV_FOLDS_RNN = [
+    {"fold": 1, "train_end": "2022-06-01", "val_start": "2022-07-01", "val_end": "2022-12-01"},
+    {"fold": 2, "train_end": "2022-12-01", "val_start": "2023-01-01", "val_end": "2023-06-01"},
+]
+
+def build_lite_rnn(window, n_features, horizon, n_regions, n_care_types, embed_dim,
+                   seed=SEED):
+    """Lite SimpleRNN for CV — same architecture at half the unit count."""
+    tf.random.set_seed(seed)
+    s_in = keras.Input(shape=(window, n_features), name="seq")
+    r_in = keras.Input(shape=(), dtype="int32", name="reg")
+    c_in = keras.Input(shape=(), dtype="int32", name="care")
+    r_e  = keras.layers.Embedding(n_regions,    embed_dim)(r_in)
+    c_e  = keras.layers.Embedding(n_care_types, embed_dim)(c_in)
+    r_r  = keras.layers.RepeatVector(window)(r_e)
+    c_r  = keras.layers.RepeatVector(window)(c_e)
+    x    = keras.layers.Concatenate(axis=-1)([s_in, r_r, c_r])
+    x    = keras.layers.SimpleRNN(32, return_sequences=True,  activation="tanh", dropout=0.1)(x)
+    x    = keras.layers.SimpleRNN(16, return_sequences=False, activation="tanh", dropout=0.1)(x)
+    out  = keras.layers.Dense(horizon)(x)
+    m    = keras.Model(inputs=[s_in, r_in, c_in], outputs=out)
+    m.compile(optimizer=keras.optimizers.Adam(1e-3), loss=keras.losses.Huber())
+    return m
+
+
+cv_rmse_list, cv_mae_list, cv_mape_list = [], [], []
+cv_records_rnn = []
+
+for fold_cfg in CV_FOLDS_RNN:
+    fold_train_df = raw[raw["period"] <= fold_cfg["train_end"]].copy()
+    Xf, Xrf, Xcf, yf, scf = make_windowed_dataset(
+        fold_train_df, window=WINDOW, horizon=HORIZON
+    )
+
+    if len(Xf) == 0:
+        print(f"Fold {fold_cfg['fold']}: not enough data — skipped")
+        continue
+
+    # Reshape X to (N, WINDOW, 1) as the lite model expects univariate input
+    Xf_seq = Xf if Xf.ndim == 3 else Xf[..., np.newaxis]
+
+    lite_model = build_lite_rnn(WINDOW, Xf_seq.shape[2], HORIZON,
+                                N_REGIONS, N_CARE_TYPES, EMBED_DIM, seed=SEED)
+    lite_model.fit(
+        [Xf_seq, Xrf, Xcf], yf,
+        epochs=80,
+        batch_size=BATCH_SIZE,
+        validation_split=0.1,
+        callbacks=[keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True)],
+        verbose=0,
+    )
+
+    # Evaluate on validation period
+    fold_errors = []
+    for (region, care_type), grp in raw.groupby(["region", "care_type"]):
+        grp = grp.sort_values("period")
+        r_id = region_map[region]
+        c_id = care_type_map[care_type]
+        mu, sigma = scf.get((r_id, c_id), (grp["demand_units"].mean(), grp["demand_units"].std()))
+        sigma = max(sigma, 1e-8)
+
+        train_sl = grp[grp["period"] <= fold_cfg["train_end"]]
+        if len(train_sl) < WINDOW:
+            continue
+        window_raw  = train_sl["demand_units"].values[-WINDOW:].astype(float)
+        window_norm = (window_raw - mu) / sigma
+        X_s = window_norm[np.newaxis, :, np.newaxis]
+
+        pred_norm = lite_model.predict([X_s, np.array([r_id]), np.array([c_id])], verbose=0)[0]
+        pred      = pred_norm * sigma + mu
+
+        val_mask = (grp["period"] >= fold_cfg["val_start"]) & (grp["period"] <= fold_cfg["val_end"])
+        actual   = grp[val_mask]["demand_units"].values
+        if len(actual) == 0:
+            continue
+
+        n = min(len(pred), len(actual))
+        fold_errors.append({
+            "rmse": np.sqrt(np.mean((pred[:n] - actual[:n]) ** 2)),
+            "mae":  np.mean(np.abs(pred[:n] - actual[:n])),
+            "mape": np.mean(np.abs((pred[:n] - actual[:n]) / actual[:n])) * 100,
+        })
+
+    if fold_errors:
+        f_rmse = np.mean([e["rmse"] for e in fold_errors])
+        f_mae  = np.mean([e["mae"]  for e in fold_errors])
+        f_mape = np.mean([e["mape"] for e in fold_errors])
+        cv_rmse_list.append(f_rmse)
+        cv_mae_list.append(f_mae)
+        cv_mape_list.append(f_mape)
+        cv_records_rnn.append({"fold": fold_cfg["fold"],
+                               "val_period": f"{fold_cfg['val_start'][:7]}→{fold_cfg['val_end'][:7]}",
+                               "RMSE": f_rmse, "MAE": f_mae, "MAPE_%": f_mape})
+        print(f"Fold {fold_cfg['fold']} | Val: {fold_cfg['val_start'][:7]}–{fold_cfg['val_end'][:7]} | "
+              f"RMSE={f_rmse:.2f}  MAE={f_mae:.2f}  MAPE={f_mape:.2f}%")
+
+    keras.backend.clear_session()   # free GPU memory between folds
+
+cv_mean_rmse = float(np.mean(cv_rmse_list)) if cv_rmse_list else float("nan")
+cv_std_rmse  = float(np.std(cv_rmse_list))  if cv_rmse_list else float("nan")
+cv_mean_mape = float(np.mean(cv_mape_list)) if cv_mape_list else float("nan")
+
+print(f"\n── CV Summary ──────────────────────────────────────────")
+print(f"   Mean RMSE : {cv_mean_rmse:.2f} ± {cv_std_rmse:.2f}")
+print(f"   Mean MAPE : {cv_mean_mape:.2f}%")
+print("(Lite model used for CV; full model trained below.)")
+
+# COMMAND ----------
+
 # MAGIC %md ## 5. Train
 
 # COMMAND ----------
@@ -240,7 +368,11 @@ with mlflow.start_run(run_name=MODEL_NAME) as run:
         "loss":         "Huber",
         "train_end":    TRAIN_END,
         "seed":         SEED,
+        "cv_n_folds":   len(CV_FOLDS_RNN),
     })
+    mlflow.log_metric("cv_mean_rmse", cv_mean_rmse)
+    mlflow.log_metric("cv_std_rmse",  cv_std_rmse)
+    mlflow.log_metric("cv_mean_mape", cv_mean_mape)
 
     history = model.fit(
         [X_seq, X_region, X_care], y,

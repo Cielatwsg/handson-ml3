@@ -195,6 +195,122 @@ def sarima_one_series(keys, pdf: pd.DataFrame) -> pd.DataFrame:
 
 # COMMAND ----------
 
+# MAGIC %md ## CV · Time Series Walk-Forward Cross-Validation
+# MAGIC
+# MAGIC Three expanding-window folds — SARIMA is refitted from scratch on each fold's
+# MAGIC training data (correct; no look-ahead).  Distribution is handled with
+# MAGIC `applyInPandas` so all 25 series are cross-validated in parallel.
+# MAGIC
+# MAGIC | Fold | Train | Validation |
+# MAGIC |---|---|---|
+# MAGIC | 1 | Jan 2021 – Dec 2021 | Jan 2022 – Jun 2022 |
+# MAGIC | 2 | Jan 2021 – Jun 2022 | Jul 2022 – Dec 2022 |
+# MAGIC | 3 | Jan 2021 – Dec 2022 | Jan 2023 – Jun 2023 |
+
+# COMMAND ----------
+
+CV_FOLDS_SARIMA = [
+    {"fold": 1, "train_end": "2021-12-01", "val_start": "2022-01-01", "val_end": "2022-06-01"},
+    {"fold": 2, "train_end": "2022-06-01", "val_start": "2022-07-01", "val_end": "2022-12-01"},
+    {"fold": 3, "train_end": "2022-12-01", "val_start": "2023-01-01", "val_end": "2023-06-01"},
+]
+
+CV_RESULT_SCHEMA = StructType([
+    StructField("fold",       StringType(), False),
+    StructField("region",     StringType(), False),
+    StructField("care_type",  StringType(), False),
+    StructField("rmse",       DoubleType(), True),
+    StructField("mae",        DoubleType(), True),
+    StructField("mape_pct",   DoubleType(), True),
+])
+
+_CV_FOLDS       = CV_FOLDS_SARIMA
+_CV_CHANGEPOINT = _CHANGEPOINT_PRIOR = 0.05  # not used in SARIMA — placeholder
+_CV_SEED        = SEED
+
+
+def sarima_cv_one_series(keys, pdf: pd.DataFrame) -> pd.DataFrame:
+    """Walk-forward CV for one (region, care_type) series using SARIMA."""
+    import pmdarima as pm
+    import numpy as np, pandas as pd, warnings
+    warnings.filterwarnings("ignore")
+    np.random.seed(_CV_SEED)
+
+    region, care_type = keys
+    pdf = pdf.sort_values("period").reset_index(drop=True)
+
+    rows = []
+    for fold_cfg in _CV_FOLDS:
+        train = pdf[pdf["period"] <= fold_cfg["train_end"]]["demand_units"]
+        val   = pdf[
+            (pdf["period"] >= fold_cfg["val_start"]) &
+            (pdf["period"] <= fold_cfg["val_end"])
+        ]["demand_units"]
+
+        if len(train) < 12 or len(val) == 0:
+            continue
+
+        try:
+            model = pm.auto_arima(
+                train, start_p=1, start_q=1, max_p=3, max_q=3,
+                d=None, D=1, m=12, seasonal=True,
+                information_criterion="aic", stepwise=True,
+                suppress_warnings=True, error_action="ignore",
+            )
+            preds = model.predict(n_periods=len(val))
+            actual = val.values
+            rows.append({
+                "fold":      str(fold_cfg["fold"]),
+                "region":    region,
+                "care_type": care_type,
+                "rmse":      float(np.sqrt(np.mean((preds - actual) ** 2))),
+                "mae":       float(np.mean(np.abs(preds - actual))),
+                "mape_pct":  float(np.mean(np.abs((preds - actual) / actual)) * 100),
+            })
+        except Exception:
+            pass
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["fold", "region", "care_type", "rmse", "mae", "mape_pct"]
+    )
+
+
+# Run distributed CV
+sdf_cv_input = (
+    spark.createDataFrame(raw[["period", "region", "care_type", "demand_units"]])
+         .withColumn("period", F.col("period").cast("date"))
+)
+
+sdf_cv_results = (
+    sdf_cv_input
+    .groupBy("region", "care_type")
+    .applyInPandas(sarima_cv_one_series, schema=CV_RESULT_SCHEMA)
+)
+
+cv_summary = (
+    sdf_cv_results
+    .groupBy("fold")
+    .agg(
+        F.avg("rmse").alias("mean_rmse"),
+        F.avg("mae").alias("mean_mae"),
+        F.avg("mape_pct").alias("mean_mape_pct"),
+    )
+    .orderBy("fold")
+    .toPandas()
+)
+
+cv_mean_rmse = float(cv_summary["mean_rmse"].mean())
+cv_std_rmse  = float(cv_summary["mean_rmse"].std())
+cv_mean_mape = float(cv_summary["mean_mape_pct"].mean())
+
+print("Walk-forward CV results:")
+print(cv_summary.to_string(index=False))
+print(f"\n── CV Summary ──────────────────────────────────────────")
+print(f"   Mean RMSE : {cv_mean_rmse:.2f} ± {cv_std_rmse:.2f}")
+print(f"   Mean MAPE : {cv_mean_mape:.2f}%")
+
+# COMMAND ----------
+
 # MAGIC %md ## 4. Distributed Execution with `applyInPandas`
 
 # COMMAND ----------
@@ -208,6 +324,10 @@ with mlflow.start_run(run_name=MODEL_NAME) as run:
     mlflow.log_param("seasonal_period", 12)
     mlflow.log_param("train_end",       TRAIN_END)
     mlflow.log_param("seed",            SEED)
+    mlflow.log_param("cv_n_folds",      len(CV_FOLDS_SARIMA))
+    mlflow.log_metric("cv_mean_rmse",   cv_mean_rmse)
+    mlflow.log_metric("cv_std_rmse",    cv_std_rmse)
+    mlflow.log_metric("cv_mean_mape",   cv_mean_mape)
 
     # Broadcast the run_id so executors can stamp it on each row
     _RUN_ID = run.info.run_id

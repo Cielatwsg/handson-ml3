@@ -258,6 +258,149 @@ def prophet_one_series(keys, pdf: pd.DataFrame) -> pd.DataFrame:
 
 # COMMAND ----------
 
+# MAGIC %md ## CV · Prophet Built-in Cross-Validation
+# MAGIC
+# MAGIC Prophet ships a `cross_validation()` utility that performs **simulated
+# MAGIC historical forecasts** automatically — no manual fold management needed.
+# MAGIC
+# MAGIC | Parameter | Value | Meaning |
+# MAGIC |---|---|---|
+# MAGIC | `initial` | 365 days (~12 m) | Minimum training window |
+# MAGIC | `period` | 182 days (~6 m) | Cutoff advances by this amount per fold |
+# MAGIC | `horizon` | 182 days (~6 m) | Forecast horizon evaluated per cutoff |
+# MAGIC
+# MAGIC This yields **3 cutpoints** within the training period:
+# MAGIC * Cutoff ≈ Dec 2021 → forecast Jan–Jun 2022
+# MAGIC * Cutoff ≈ Jun 2022 → forecast Jul–Dec 2022
+# MAGIC * Cutoff ≈ Dec 2022 → forecast Jan–Jun 2023
+# MAGIC
+# MAGIC Distributed CV: `applyInPandas` runs Prophet CV on all 25 series in parallel.
+
+# COMMAND ----------
+
+PROPHET_CV_INITIAL = "365 days"    # ~12 months minimum training
+PROPHET_CV_PERIOD  = "182 days"    # cutoff advances ~6 months each fold
+PROPHET_CV_HORIZON = "182 days"    # evaluate 6 months ahead
+
+CV_RESULT_SCHEMA_PROPHET = StructType([
+    StructField("region",    StringType(), False),
+    StructField("care_type", StringType(), False),
+    StructField("fold",      StringType(), False),
+    StructField("cutoff",    StringType(), True),
+    StructField("rmse",      DoubleType(), True),
+    StructField("mae",       DoubleType(), True),
+    StructField("mape_pct",  DoubleType(), True),
+])
+
+_CV_INITIAL = PROPHET_CV_INITIAL
+_CV_PERIOD  = PROPHET_CV_PERIOD
+_CV_HORIZON = PROPHET_CV_HORIZON
+
+
+def prophet_cv_one_series(keys, pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Run Prophet's built-in cross_validation on one (region, care_type) series.
+    Executed on Spark executors via applyInPandas.
+    """
+    from prophet import Prophet
+    from prophet.diagnostics import cross_validation, performance_metrics
+    import numpy as np, pandas as pd, warnings, logging
+    warnings.filterwarnings("ignore")
+    logging.getLogger("prophet").setLevel(logging.ERROR)
+    logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
+    np.random.seed(_SEED)
+
+    region, care_type = keys
+    pdf = pdf.sort_values("period").reset_index(drop=True)
+    prophet_input = pdf.rename(columns={"period": "ds", "demand_units": "y"})
+
+    # Only use training portion (up to TRAIN_END) for CV to avoid look-ahead
+    prophet_train = prophet_input[prophet_input["ds"] <= _TRAIN_END].copy()
+    if len(prophet_train) < 14:
+        return pd.DataFrame(columns=["region","care_type","fold","cutoff","rmse","mae","mape_pct"])
+
+    try:
+        m = Prophet(
+            seasonality_mode="multiplicative",
+            changepoint_prior_scale=_CHANGEPOINT_PRIOR,
+            seasonality_prior_scale=_SEASONALITY_PRIOR,
+            interval_width=0.80,
+            uncertainty_samples=200,    # fewer samples for CV speed
+            yearly_seasonality=True,
+            weekly_seasonality=False,
+            daily_seasonality=False,
+        )
+        m.add_regressor("pop_norm", standardize=False)
+        m.fit(prophet_train[["ds", "y", "pop_norm"]])
+
+        df_cv   = cross_validation(
+            m, initial=_CV_INITIAL, period=_CV_PERIOD, horizon=_CV_HORIZON,
+            parallel=None,   # already inside a Spark executor — no inner parallelism
+        )
+        df_perf = performance_metrics(df_cv, rolling_window=1.0)
+
+        rows = []
+        for fold_i, (cutoff, grp) in enumerate(df_cv.groupby("cutoff"), start=1):
+            actual = grp["y"].values
+            pred   = grp["yhat"].clip(lower=0).values
+            rows.append({
+                "region":    region,
+                "care_type": care_type,
+                "fold":      str(fold_i),
+                "cutoff":    str(cutoff.date()),
+                "rmse":      float(np.sqrt(np.mean((pred - actual) ** 2))),
+                "mae":       float(np.mean(np.abs(pred - actual))),
+                "mape_pct":  float(np.mean(np.abs((pred - actual) / np.maximum(actual, 1))) * 100),
+            })
+        return pd.DataFrame(rows)
+
+    except Exception as e:
+        return pd.DataFrame([{
+            "region": region, "care_type": care_type,
+            "fold": "error", "cutoff": str(e)[:80],
+            "rmse": None, "mae": None, "mape_pct": None,
+        }])
+
+
+# Run distributed CV
+sdf_cv_input = (
+    spark.createDataFrame(
+        raw[["period", "region", "care_type", "demand_units", "pop_norm"]]
+    )
+    .withColumn("period", F.col("period").cast("date"))
+)
+
+sdf_prophet_cv = (
+    sdf_cv_input
+    .groupBy("region", "care_type")
+    .applyInPandas(prophet_cv_one_series, schema=CV_RESULT_SCHEMA_PROPHET)
+    .filter(F.col("fold") != "error")
+)
+
+cv_summary_prophet = (
+    sdf_prophet_cv
+    .groupBy("fold", "cutoff")
+    .agg(
+        F.avg("rmse").alias("mean_rmse"),
+        F.avg("mae").alias("mean_mae"),
+        F.avg("mape_pct").alias("mean_mape_pct"),
+    )
+    .orderBy("cutoff")
+    .toPandas()
+)
+
+cv_mean_rmse = float(cv_summary_prophet["mean_rmse"].mean()) if len(cv_summary_prophet) > 0 else float("nan")
+cv_std_rmse  = float(cv_summary_prophet["mean_rmse"].std())  if len(cv_summary_prophet) > 1 else 0.0
+cv_mean_mape = float(cv_summary_prophet["mean_mape_pct"].mean()) if len(cv_summary_prophet) > 0 else float("nan")
+
+print("Prophet Walk-Forward CV Results (per cutoff, mean across all 25 series):")
+print(cv_summary_prophet[["fold", "cutoff", "mean_rmse", "mean_mae", "mean_mape_pct"]].to_string(index=False))
+print(f"\n── CV Summary ──────────────────────────────────────────")
+print(f"   Mean RMSE : {cv_mean_rmse:.2f} ± {cv_std_rmse:.2f}")
+print(f"   Mean MAPE : {cv_mean_mape:.2f}%")
+
+# COMMAND ----------
+
 # MAGIC %md ## 5. Distributed Execution via `applyInPandas`
 
 # COMMAND ----------
@@ -276,7 +419,13 @@ with mlflow.start_run(run_name=MODEL_NAME) as run:
         "horizon":              HORIZON,
         "train_end":            TRAIN_END,
         "seed":                 SEED,
+        "cv_initial":           PROPHET_CV_INITIAL,
+        "cv_period":            PROPHET_CV_PERIOD,
+        "cv_horizon":           PROPHET_CV_HORIZON,
     })
+    mlflow.log_metric("cv_mean_rmse", cv_mean_rmse)
+    mlflow.log_metric("cv_std_rmse",  cv_std_rmse)
+    mlflow.log_metric("cv_mean_mape", cv_mean_mape)
 
     _RUN_ID = run.info.run_id
 

@@ -141,6 +141,80 @@ def holt_winters(series: pd.Series, horizon: int) -> tuple:
 
 # COMMAND ----------
 
+# MAGIC %md ## CV · Time Series Walk-Forward Cross-Validation
+# MAGIC
+# MAGIC **Expanding-window** scheme: the training window grows with each fold while
+# MAGIC the validation window is always the next 6 months — matching the live forecast horizon.
+# MAGIC
+# MAGIC | Fold | Train period | Validation period |
+# MAGIC |---|---|---|
+# MAGIC | 1 | Jan 2021 – Dec 2021 | Jan 2022 – Jun 2022 |
+# MAGIC | 2 | Jan 2021 – Jun 2022 | Jul 2022 – Dec 2022 |
+# MAGIC | 3 | Jan 2021 – Dec 2022 | Jan 2023 – Jun 2023 |
+# MAGIC
+# MAGIC For each fold and each series the best sub-method (Naïve / MA / Holt-Winters)
+# MAGIC is selected independently, exactly as it will be on the final hold-out.
+
+# COMMAND ----------
+
+CV_FOLDS = [
+    {"fold": 1, "train_end": "2021-12-01", "val_start": "2022-01-01", "val_end": "2022-06-01"},
+    {"fold": 2, "train_end": "2022-06-01", "val_start": "2022-07-01", "val_end": "2022-12-01"},
+    {"fold": 3, "train_end": "2022-12-01", "val_start": "2023-01-01", "val_end": "2023-06-01"},
+]
+
+cv_records = []
+
+for fold_cfg in CV_FOLDS:
+    fold_rmse_list, fold_mae_list, fold_mape_list = [], [], []
+
+    for (region, care_type), grp in raw.groupby(["region", "care_type"]):
+        grp = grp.sort_values("period")
+        series_tr  = grp[grp["period"] <= fold_cfg["train_end"]]["demand_units"]
+        series_val = grp[
+            (grp["period"] >= fold_cfg["val_start"]) &
+            (grp["period"] <= fold_cfg["val_end"])
+        ]["demand_units"]
+
+        if len(series_tr) < 12 or len(series_val) == 0:
+            continue
+
+        h = len(series_val)
+        actual = series_val.values
+
+        # Select best sub-method using this fold's training data only
+        best_sub, _, sn_p, ma_p, hw_p, _, _ = forecast_series(series_tr, series_val)
+        best_pred = {"seasonal_naive": sn_p,
+                     "moving_average": ma_p,
+                     "holt_winters":   hw_p}[best_sub]
+
+        fold_rmse_list.append(np.sqrt(np.mean((best_pred - actual) ** 2)))
+        fold_mae_list.append(np.mean(np.abs(best_pred - actual)))
+        fold_mape_list.append(np.mean(np.abs((best_pred - actual) / actual)) * 100)
+
+    fold_result = {
+        "fold":       fold_cfg["fold"],
+        "val_period": f"{fold_cfg['val_start'][:7]} → {fold_cfg['val_end'][:7]}",
+        "RMSE":       np.mean(fold_rmse_list),
+        "MAE":        np.mean(fold_mae_list),
+        "MAPE_%":     np.mean(fold_mape_list),
+        "n_series":   len(fold_rmse_list),
+    }
+    cv_records.append(fold_result)
+    print(f"Fold {fold_cfg['fold']} | Val: {fold_result['val_period']} | "
+          f"RMSE={fold_result['RMSE']:.2f}  MAE={fold_result['MAE']:.2f}  "
+          f"MAPE={fold_result['MAPE_%']:.2f}%")
+
+cv_df = pd.DataFrame(cv_records)
+cv_mean_rmse = cv_df["RMSE"].mean()
+cv_std_rmse  = cv_df["RMSE"].std()
+cv_mean_mape = cv_df["MAPE_%"].mean()
+print(f"\n── CV Summary ──────────────────────────────────────────")
+print(f"   Mean RMSE : {cv_mean_rmse:.2f} ± {cv_std_rmse:.2f}")
+print(f"   Mean MAPE : {cv_mean_mape:.2f}%")
+
+# COMMAND ----------
+
 # MAGIC %md ## 4. Train, Evaluate and Select Best Sub-method
 
 # COMMAND ----------
@@ -176,6 +250,10 @@ with mlflow.start_run(run_name=MODEL_NAME) as run:
     mlflow.log_param("train_end",  TRAIN_END)
     mlflow.log_param("test_start", TEST_START)
     mlflow.log_param("seed",       SEED)
+    mlflow.log_metric("cv_mean_rmse", cv_mean_rmse)
+    mlflow.log_metric("cv_std_rmse",  cv_std_rmse)
+    mlflow.log_metric("cv_mean_mape", cv_mean_mape)
+    mlflow.log_param("cv_n_folds",    len(CV_FOLDS))
 
     series_rmse = {}
 

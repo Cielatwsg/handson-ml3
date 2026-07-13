@@ -182,6 +182,66 @@ region_metrics = (
 
 # COMMAND ----------
 
+# MAGIC %md ## CV · Cross-Validation Summary from MLflow
+# MAGIC
+# MAGIC Each forecast notebook logged `cv_mean_rmse` and `cv_mean_mape` to its MLflow run.
+# MAGIC Here we retrieve those values and display them alongside the final hold-out metrics
+# MAGIC so you can see whether the **CV estimate predicted the hold-out ranking correctly**.
+
+# COMMAND ----------
+
+cv_mlflow_rows = []
+for model_name in MODEL_LABELS:
+    try:
+        runs = mlflow.search_runs(
+            experiment_names=[EXPERIMENT],
+            filter_string=f"tags.model_name = '{model_name}'",
+            order_by=["start_time DESC"],
+            max_results=1,
+        )
+        if len(runs) == 0:
+            continue
+        r = runs.iloc[0]
+        cv_mlflow_rows.append({
+            "model_name":    model_name,
+            "model_label":   MODEL_LABELS[model_name].split("·")[1].strip(),
+            "cv_mean_rmse":  r.get("metrics.cv_mean_rmse", float("nan")),
+            "cv_std_rmse":   r.get("metrics.cv_std_rmse",  float("nan")),
+            "cv_mean_mape":  r.get("metrics.cv_mean_mape", float("nan")),
+            "cv_n_folds":    r.get("params.cv_n_folds", "?"),
+        })
+    except Exception as e:
+        print(f"  Could not load CV metrics for {model_name}: {e}")
+
+cv_mlflow_df = pd.DataFrame(cv_mlflow_rows)
+
+if len(cv_mlflow_df) > 0:
+    cv_merged = cv_mlflow_df.merge(
+        overall_metrics[["model_name", "RMSE", "MAPE_%", "Rank"]],
+        on="model_name", how="left"
+    ).sort_values("cv_mean_rmse")
+
+    cv_merged["cv_rank"]       = range(1, len(cv_merged) + 1)
+    cv_merged["holdout_rank"]  = cv_merged["Rank"].astype(int)
+    cv_merged["rank_match"]    = cv_merged["cv_rank"] == cv_merged["holdout_rank"]
+
+    print("\n" + "="*90)
+    print("  CROSS-VALIDATION vs HOLD-OUT COMPARISON")
+    print("="*90)
+    print(f"{'Model':<40}  {'CV RMSE':>10}  {'Holdout RMSE':>12}  {'CV Rank':>7}  {'HO Rank':>7}  {'Match?':>6}")
+    print("-"*90)
+    for _, row in cv_merged.iterrows():
+        match_sym = "✓" if row["rank_match"] else "✗"
+        print(f"  {row['model_label']:<38}  {row['cv_mean_rmse']:>10.2f}  "
+              f"{row['RMSE']:>12.2f}  {row['cv_rank']:>7}  {row['holdout_rank']:>7}  {match_sym:>6}")
+    print("="*90)
+    n_correct = cv_merged["rank_match"].sum()
+    print(f"\n  CV predicted {n_correct}/{len(cv_merged)} model ranks correctly.\n")
+else:
+    print("No CV metrics found in MLflow — ensure forecast notebooks have been run.")
+
+# COMMAND ----------
+
 # MAGIC %md ## 4. Log to MLflow
 
 # COMMAND ----------
@@ -263,6 +323,26 @@ COLOURS = {
     "cnn_wavenet_lstm": "#dc3545",   # red
     "prophet":          "#6f42c1",   # purple
 }
+
+# ── 6.0 CV vs Hold-out RMSE scatter ──────────────────────────────────────
+if len(cv_mlflow_df) > 0 and "RMSE" in cv_merged.columns:
+    fig_cv, ax_cv = plt.subplots(figsize=(7, 5))
+    for _, row in cv_merged.iterrows():
+        colour = COLOURS.get(row["model_name"], "#888")
+        ax_cv.scatter(row["cv_mean_rmse"], row["RMSE"], s=120, color=colour,
+                      zorder=5, label=row["model_label"])
+        ax_cv.annotate(row["model_label"], (row["cv_mean_rmse"], row["RMSE"]),
+                       textcoords="offset points", xytext=(5, 3), fontsize=8)
+    lims = [min(cv_merged["cv_mean_rmse"].min(), cv_merged["RMSE"].min()) * 0.95,
+            max(cv_merged["cv_mean_rmse"].max(), cv_merged["RMSE"].max()) * 1.05]
+    ax_cv.plot(lims, lims, "k--", alpha=0.4, linewidth=1, label="Perfect calibration")
+    ax_cv.set_xlabel("CV Mean RMSE (in-training folds)")
+    ax_cv.set_ylabel("Hold-out RMSE (Jul–Dec 2023)")
+    ax_cv.set_title("CV RMSE vs Hold-out RMSE\n(closer to diagonal = better-calibrated CV)")
+    ax_cv.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("/tmp/eval_00_cv_vs_holdout.png", dpi=130, bbox_inches="tight")
+    plt.show()
 
 # ── 6.1 Overall Metrics Bar Chart ─────────────────────────────────────────
 fig, axes = plt.subplots(1, 3, figsize=(16, 5))
@@ -452,6 +532,7 @@ plt.show()
 
 # ── Log all charts to MLflow ──────────────────────────────────────────────
 chart_files = [
+    "/tmp/eval_00_cv_vs_holdout.png",
     "/tmp/eval_01_overall_metrics.png",
     "/tmp/eval_02_region_heatmap.png",
     "/tmp/eval_03_care_type_heatmap.png",
@@ -459,9 +540,11 @@ chart_files = [
     "/tmp/eval_05_all_series_future.png",
     "/tmp/eval_06_monthly_rmse.png",
 ]
+import os
 with mlflow.start_run(run_id=eval_run_id):
     for f in chart_files:
-        mlflow.log_artifact(f)
+        if os.path.exists(f):
+            mlflow.log_artifact(f)
 
 # COMMAND ----------
 
