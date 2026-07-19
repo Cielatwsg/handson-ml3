@@ -1,0 +1,529 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # 03 · Simple RNN Forecast
+# MAGIC
+# MAGIC **Method level**: Deep Learning — Entry (Level 3 of 5)
+# MAGIC
+# MAGIC Based on **Chapter 15: Processing Sequences Using RNNs and CNNs**
+# MAGIC (*Hands-On Machine Learning with Scikit-Learn, Keras & TensorFlow*, Géron).
+# MAGIC
+# MAGIC ### Architecture
+# MAGIC ```
+# MAGIC Input  →  SimpleRNN(64)  →  SimpleRNN(32)  →  Dense(6)
+# MAGIC ```
+# MAGIC * **Input window**: last 18 months
+# MAGIC * **Output**: 6-step-ahead multi-output forecast (direct strategy from Ch15)
+# MAGIC * **Loss**: Huber (robust to outliers)
+# MAGIC * **Normalisation**: per-series min–max scaling
+# MAGIC
+# MAGIC A **global model** is trained on all 25 series simultaneously, with
+# MAGIC region and care-type embeddings passed as additional features.
+
+# COMMAND ----------
+
+# MAGIC %md ## 1. Configuration
+
+# COMMAND ----------
+
+dbutils.widgets.text("catalog",    "hive_metastore",   "Catalog")
+dbutils.widgets.text("schema",     "demand_forecast",  "Schema")
+dbutils.widgets.text("src_table",  "ooh_care_monthly", "Source table")
+dbutils.widgets.text("experiment", "/Shared/ooh_care_demand_forecast", "MLflow experiment")
+dbutils.widgets.text("horizon",    "6",  "Forecast horizon (months)")
+dbutils.widgets.text("window",     "18", "Lookback window (months)")
+dbutils.widgets.text("epochs",     "200","Max training epochs")
+dbutils.widgets.text("batch_size", "32", "Mini-batch size")
+dbutils.widgets.text("seed",       "42", "Global random seed for reproducibility")
+
+CATALOG    = dbutils.widgets.get("catalog")
+SCHEMA     = dbutils.widgets.get("schema")
+SRC_TABLE  = f"{CATALOG}.{SCHEMA}.{dbutils.widgets.get('src_table')}"
+FCST_TABLE = f"{CATALOG}.{SCHEMA}.ooh_care_forecasts"
+EXPERIMENT = dbutils.widgets.get("experiment")
+HORIZON    = int(dbutils.widgets.get("horizon"))
+WINDOW     = int(dbutils.widgets.get("window"))
+EPOCHS     = int(dbutils.widgets.get("epochs"))
+BATCH_SIZE = int(dbutils.widgets.get("batch_size"))
+SEED       = int(dbutils.widgets.get("seed"))
+
+MODEL_NAME   = "simple_rnn"
+TRAIN_END    = "2023-06-01"
+TEST_START   = "2023-07-01"
+TEST_END     = "2023-12-01"
+FUTURE_START = "2024-01-01"
+
+print(f"Source  : {SRC_TABLE}")
+print(f"Results : {FCST_TABLE}")
+print(f"Model   : {MODEL_NAME}")
+print(f"Window  : {WINDOW}  |  Horizon: {HORIZON}  |  Epochs: {EPOCHS}")
+
+# COMMAND ----------
+
+# MAGIC %pip install --quiet tensorflow
+
+# COMMAND ----------
+
+# MAGIC %md ## 2. Reproducibility Seeds
+# MAGIC
+# MAGIC Full determinism requires pinning seeds at every level of the stack.
+
+# COMMAND ----------
+
+import os, random
+os.environ["PYTHONHASHSEED"]         = str(SEED)  # Python dict/set ordering
+os.environ["TF_DETERMINISTIC_OPS"]   = "1"        # TF GPU op determinism
+os.environ["TF_CUDNN_DETERMINISTIC"] = "1"        # cuDNN determinism
+random.seed(SEED)
+
+import numpy as np
+np.random.seed(SEED)
+
+import pandas as pd
+from datetime import datetime, timezone
+import tensorflow as tf
+tf.random.set_seed(SEED)   # TF graph-level and op-level seed
+
+from tensorflow import keras
+import mlflow
+import mlflow.keras
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField,
+    DateType, StringType, DoubleType, BooleanType, TimestampType
+)
+
+print(f"TensorFlow version: {tf.__version__}")
+print(f"Global seed       : {SEED}")
+
+# COMMAND ----------
+
+# MAGIC %md ## 2. Load and Prepare Data
+
+# COMMAND ----------
+
+raw = spark.table(SRC_TABLE).toPandas()
+raw["period"] = pd.to_datetime(raw["period"])
+raw = raw.sort_values(["region", "care_type", "period"]).reset_index(drop=True)
+
+# Encode categorical keys as integers for embedding layers
+regions    = sorted(raw["region"].unique())
+care_types = sorted(raw["care_type"].unique())
+region_map    = {r: i for i, r in enumerate(regions)}
+care_type_map = {c: i for i, c in enumerate(care_types)}
+
+raw["region_id"]    = raw["region"].map(region_map)
+raw["care_type_id"] = raw["care_type"].map(care_type_map)
+
+N_REGIONS    = len(regions)
+N_CARE_TYPES = len(care_types)
+print(f"Regions: {N_REGIONS}  |  Care types: {N_CARE_TYPES}")
+
+# COMMAND ----------
+
+# MAGIC %md ## 3. Windowed Dataset (Chapter 15 approach)
+# MAGIC
+# MAGIC We create overlapping windows across all series:
+# MAGIC `[t-17, …, t] → [t+1, …, t+6]`
+
+# COMMAND ----------
+
+def make_windowed_dataset(df_train, window=WINDOW, horizon=HORIZON):
+    """
+    Build (X_seq, X_region, X_care, y) arrays from training data.
+    Each row is one window from one series, normalised by that series' stats.
+    """
+    X_seq, X_region, X_care, y = [], [], [], []
+    scalers = {}   # (region, care_type) → (mean, std)
+
+    for (region_id, care_type_id), grp in df_train.groupby(["region_id", "care_type_id"]):
+        vals = grp.sort_values("period")["demand_units"].values.astype(float)
+
+        # Per-series z-score normalisation
+        mu, sigma = vals.mean(), vals.std(ddof=1)
+        sigma = max(sigma, 1e-8)
+        scalers[(region_id, care_type_id)] = (mu, sigma)
+        vals_norm = (vals - mu) / sigma
+
+        for start in range(len(vals_norm) - window - horizon + 1):
+            X_seq.append(vals_norm[start : start + window])
+            X_region.append(region_id)
+            X_care.append(care_type_id)
+            y.append(vals_norm[start + window : start + window + horizon])
+
+    return (
+        np.array(X_seq)[..., np.newaxis],   # (N, window, 1)
+        np.array(X_region),                  # (N,)
+        np.array(X_care),                    # (N,)
+        np.array(y),                         # (N, horizon)
+        scalers,
+    )
+
+
+train_df = raw[raw["period"] <= TRAIN_END].copy()
+X_seq, X_region, X_care, y, scalers = make_windowed_dataset(train_df)
+
+print(f"Windows: {len(X_seq):,}  |  X_seq shape: {X_seq.shape}  |  y shape: {y.shape}")
+
+# COMMAND ----------
+
+# MAGIC %md ## 4. Build Simple RNN Model (Chapter 15)
+# MAGIC
+# MAGIC Two stacked `SimpleRNN` layers followed by a `Dense` output layer
+# MAGIC producing all 6 forecast steps in one shot (direct multi-output).
+
+# COMMAND ----------
+
+EMBED_DIM = 8
+
+# Sequence input
+seq_input    = keras.Input(shape=(WINDOW, 1), name="sequence")
+region_input = keras.Input(shape=(), dtype="int32", name="region")
+care_input   = keras.Input(shape=(), dtype="int32", name="care_type")
+
+# Categorical embeddings (help the model learn series-level patterns)
+region_emb    = keras.layers.Embedding(N_REGIONS,    EMBED_DIM, name="region_emb")(region_input)
+care_emb      = keras.layers.Embedding(N_CARE_TYPES, EMBED_DIM, name="care_type_emb")(care_input)
+
+# Repeat embeddings across timesteps and concatenate with sequence
+region_rep = keras.layers.RepeatVector(WINDOW)(region_emb)
+care_rep   = keras.layers.RepeatVector(WINDOW)(care_emb)
+merged     = keras.layers.Concatenate(axis=-1)([seq_input, region_rep, care_rep])
+
+# Simple RNN stack (Chapter 15, §"Deep RNNs")
+rnn1 = keras.layers.SimpleRNN(64, return_sequences=True, activation="tanh",
+                               dropout=0.1, name="rnn_1")(merged)
+rnn2 = keras.layers.SimpleRNN(32, return_sequences=False, activation="tanh",
+                               dropout=0.1, name="rnn_2")(rnn1)
+
+output = keras.layers.Dense(HORIZON, name="forecast")(rnn2)
+
+model = keras.Model(
+    inputs=[seq_input, region_input, care_input],
+    outputs=output,
+    name="SimpleRNN_OOH_Forecast",
+)
+
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+    loss=keras.losses.Huber(),
+    metrics=["mae"],
+)
+model.summary()
+
+# COMMAND ----------
+
+# MAGIC %md ## CV · Time Series Walk-Forward Cross-Validation
+# MAGIC
+# MAGIC A **lite version** of the SimpleRNN (half the units, capped at 80 epochs) is
+# MAGIC trained independently on each fold's training windows, then evaluated on the
+# MAGIC corresponding validation windows.  This is true walk-forward CV — the lite model
+# MAGIC never sees validation data during training.
+# MAGIC
+# MAGIC With `WINDOW=18`, two folds fit within the training period:
+# MAGIC
+# MAGIC | Fold | Train period | Validation period |
+# MAGIC |---|---|---|
+# MAGIC | 1 | Jan 2021 – Jun 2022 (18 m) | Jul 2022 – Dec 2022 |
+# MAGIC | 2 | Jan 2021 – Dec 2022 (24 m) | Jan 2023 – Jun 2023 |
+# MAGIC
+# MAGIC CV RMSE gives an unbiased estimate of generalisation; the **full model** trained
+# MAGIC below uses the entire training set for the best possible final forecast.
+
+# COMMAND ----------
+
+CV_FOLDS_RNN = [
+    {"fold": 1, "train_end": "2022-06-01", "val_start": "2022-07-01", "val_end": "2022-12-01"},
+    {"fold": 2, "train_end": "2022-12-01", "val_start": "2023-01-01", "val_end": "2023-06-01"},
+]
+
+def build_lite_rnn(window, n_features, horizon, n_regions, n_care_types, embed_dim,
+                   seed=SEED):
+    """Lite SimpleRNN for CV — same architecture at half the unit count."""
+    tf.random.set_seed(seed)
+    s_in = keras.Input(shape=(window, n_features), name="seq")
+    r_in = keras.Input(shape=(), dtype="int32", name="reg")
+    c_in = keras.Input(shape=(), dtype="int32", name="care")
+    r_e  = keras.layers.Embedding(n_regions,    embed_dim)(r_in)
+    c_e  = keras.layers.Embedding(n_care_types, embed_dim)(c_in)
+    r_r  = keras.layers.RepeatVector(window)(r_e)
+    c_r  = keras.layers.RepeatVector(window)(c_e)
+    x    = keras.layers.Concatenate(axis=-1)([s_in, r_r, c_r])
+    x    = keras.layers.SimpleRNN(32, return_sequences=True,  activation="tanh", dropout=0.1)(x)
+    x    = keras.layers.SimpleRNN(16, return_sequences=False, activation="tanh", dropout=0.1)(x)
+    out  = keras.layers.Dense(horizon)(x)
+    m    = keras.Model(inputs=[s_in, r_in, c_in], outputs=out)
+    m.compile(optimizer=keras.optimizers.Adam(1e-3), loss=keras.losses.Huber())
+    return m
+
+
+cv_rmse_list, cv_mae_list, cv_mape_list = [], [], []
+cv_records_rnn = []
+
+for fold_cfg in CV_FOLDS_RNN:
+    fold_train_df = raw[raw["period"] <= fold_cfg["train_end"]].copy()
+    Xf, Xrf, Xcf, yf, scf = make_windowed_dataset(
+        fold_train_df, window=WINDOW, horizon=HORIZON
+    )
+
+    if len(Xf) == 0:
+        print(f"Fold {fold_cfg['fold']}: not enough data — skipped")
+        continue
+
+    # Reshape X to (N, WINDOW, 1) as the lite model expects univariate input
+    Xf_seq = Xf if Xf.ndim == 3 else Xf[..., np.newaxis]
+
+    lite_model = build_lite_rnn(WINDOW, Xf_seq.shape[2], HORIZON,
+                                N_REGIONS, N_CARE_TYPES, EMBED_DIM, seed=SEED)
+    lite_model.fit(
+        [Xf_seq, Xrf, Xcf], yf,
+        epochs=80,
+        batch_size=BATCH_SIZE,
+        validation_split=0.1,
+        callbacks=[keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True)],
+        verbose=0,
+    )
+
+    # Evaluate on validation period
+    fold_errors = []
+    for (region, care_type), grp in raw.groupby(["region", "care_type"]):
+        grp = grp.sort_values("period")
+        r_id = region_map[region]
+        c_id = care_type_map[care_type]
+        mu, sigma = scf.get((r_id, c_id), (grp["demand_units"].mean(), grp["demand_units"].std()))
+        sigma = max(sigma, 1e-8)
+
+        train_sl = grp[grp["period"] <= fold_cfg["train_end"]]
+        if len(train_sl) < WINDOW:
+            continue
+        window_raw  = train_sl["demand_units"].values[-WINDOW:].astype(float)
+        window_norm = (window_raw - mu) / sigma
+        X_s = window_norm[np.newaxis, :, np.newaxis]
+
+        pred_norm = lite_model.predict([X_s, np.array([r_id]), np.array([c_id])], verbose=0)[0]
+        pred      = pred_norm * sigma + mu
+
+        val_mask = (grp["period"] >= fold_cfg["val_start"]) & (grp["period"] <= fold_cfg["val_end"])
+        actual   = grp[val_mask]["demand_units"].values
+        if len(actual) == 0:
+            continue
+
+        n = min(len(pred), len(actual))
+        fold_errors.append({
+            "rmse": np.sqrt(np.mean((pred[:n] - actual[:n]) ** 2)),
+            "mae":  np.mean(np.abs(pred[:n] - actual[:n])),
+            "mape": np.mean(np.abs((pred[:n] - actual[:n]) / actual[:n])) * 100,
+        })
+
+    if fold_errors:
+        f_rmse = np.mean([e["rmse"] for e in fold_errors])
+        f_mae  = np.mean([e["mae"]  for e in fold_errors])
+        f_mape = np.mean([e["mape"] for e in fold_errors])
+        cv_rmse_list.append(f_rmse)
+        cv_mae_list.append(f_mae)
+        cv_mape_list.append(f_mape)
+        cv_records_rnn.append({"fold": fold_cfg["fold"],
+                               "val_period": f"{fold_cfg['val_start'][:7]}→{fold_cfg['val_end'][:7]}",
+                               "RMSE": f_rmse, "MAE": f_mae, "MAPE_%": f_mape})
+        print(f"Fold {fold_cfg['fold']} | Val: {fold_cfg['val_start'][:7]}–{fold_cfg['val_end'][:7]} | "
+              f"RMSE={f_rmse:.2f}  MAE={f_mae:.2f}  MAPE={f_mape:.2f}%")
+
+    keras.backend.clear_session()   # free GPU memory between folds
+
+cv_mean_rmse = float(np.mean(cv_rmse_list)) if cv_rmse_list else float("nan")
+cv_std_rmse  = float(np.std(cv_rmse_list))  if cv_rmse_list else float("nan")
+cv_mean_mape = float(np.mean(cv_mape_list)) if cv_mape_list else float("nan")
+
+print(f"\n── CV Summary ──────────────────────────────────────────")
+print(f"   Mean RMSE : {cv_mean_rmse:.2f} ± {cv_std_rmse:.2f}")
+print(f"   Mean MAPE : {cv_mean_mape:.2f}%")
+print("(Lite model used for CV; full model trained below.)")
+
+# COMMAND ----------
+
+# MAGIC %md ## 5. Train
+
+# COMMAND ----------
+
+callbacks = [
+    keras.callbacks.EarlyStopping(
+        monitor="val_loss", patience=20, restore_best_weights=True, verbose=1
+    ),
+    keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss", factor=0.5, patience=10, min_lr=1e-6, verbose=1
+    ),
+]
+
+mlflow.set_experiment(EXPERIMENT)
+
+with mlflow.start_run(run_name=MODEL_NAME) as run:
+    mlflow.set_tag("model_name", MODEL_NAME)
+    mlflow.log_params({
+        "architecture": "SimpleRNN",
+        "rnn_units":    "64→32",
+        "embed_dim":    EMBED_DIM,
+        "window":       WINDOW,
+        "horizon":      HORIZON,
+        "epochs_max":   EPOCHS,
+        "batch_size":   BATCH_SIZE,
+        "loss":         "Huber",
+        "train_end":    TRAIN_END,
+        "seed":         SEED,
+        "cv_n_folds":   len(CV_FOLDS_RNN),
+    })
+    mlflow.log_metric("cv_mean_rmse", cv_mean_rmse)
+    mlflow.log_metric("cv_std_rmse",  cv_std_rmse)
+    mlflow.log_metric("cv_mean_mape", cv_mean_mape)
+
+    history = model.fit(
+        [X_seq, X_region, X_care], y,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=0.15,
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    best_val_loss = float(min(history.history["val_loss"]))
+    actual_epochs = len(history.history["loss"])
+    mlflow.log_metric("best_val_loss", best_val_loss)
+    mlflow.log_metric("actual_epochs",  actual_epochs)
+    print(f"Training complete: {actual_epochs} epochs | best val_loss={best_val_loss:.4f}")
+
+    # ── Generate forecasts ─────────────────────────────────────────────────
+    run_timestamp = datetime.now(timezone.utc)
+    all_rows = []
+
+    for (region, care_type), grp in raw.groupby(["region", "care_type"]):
+        grp = grp.sort_values("period")
+        r_id = region_map[region]
+        c_id = care_type_map[care_type]
+        mu, sigma = scalers.get((r_id, c_id), (grp["demand_units"].mean(), grp["demand_units"].std()))
+
+        def predict_from_series(series_vals, is_test):
+            window_raw  = series_vals[-WINDOW:]
+            window_norm = (window_raw - mu) / max(sigma, 1e-8)
+            X_s = np.array(window_norm)[np.newaxis, :, np.newaxis]
+            X_r = np.array([r_id])
+            X_c = np.array([c_id])
+            pred_norm = model.predict([X_s, X_r, X_c], verbose=0)[0]
+            pred      = pred_norm * sigma + mu
+            # Approximate 80 % PI from residual std
+            pred_std  = sigma * 0.12
+            lo = pred - 1.282 * pred_std
+            hi = pred + 1.282 * pred_std
+            return pred, lo, hi
+
+        # Test-set forecast (trained on train only)
+        train_vals  = grp[grp["period"] <= TRAIN_END]["demand_units"].values.astype(float)
+        test_pred, test_lo, test_hi = predict_from_series(train_vals, True)
+        test_dates = pd.date_range(TEST_START, periods=HORIZON, freq="MS")
+        for dt, fv, lo, hi in zip(test_dates, test_pred, test_lo, test_hi):
+            all_rows.append({
+                "period": dt.date(), "region": region, "care_type": care_type,
+                "model_name": MODEL_NAME,
+                "forecast_value": float(fv), "lower_bound": float(lo), "upper_bound": float(hi),
+                "is_test_set": True, "run_timestamp": run_timestamp,
+                "mlflow_run_id": run.info.run_id,
+            })
+
+        # Future forecast (full series)
+        full_vals = grp["demand_units"].values.astype(float)
+        fut_pred, fut_lo, fut_hi = predict_from_series(full_vals, False)
+        future_dates = pd.date_range(FUTURE_START, periods=HORIZON, freq="MS")
+        for dt, fv, lo, hi in zip(future_dates, fut_pred, fut_lo, fut_hi):
+            all_rows.append({
+                "period": dt.date(), "region": region, "care_type": care_type,
+                "model_name": MODEL_NAME,
+                "forecast_value": float(fv), "lower_bound": float(lo), "upper_bound": float(hi),
+                "is_test_set": False, "run_timestamp": run_timestamp,
+                "mlflow_run_id": run.info.run_id,
+            })
+
+    # Compute hold-out RMSE
+    test_rows = [r for r in all_rows if r["is_test_set"]]
+    test_pdf  = pd.DataFrame(test_rows)
+    actuals   = raw[(raw["period"] >= TEST_START) & (raw["period"] <= TEST_END)][
+                    ["period", "region", "care_type", "demand_units"]
+                ].copy()
+    actuals["period"] = actuals["period"].dt.date
+    merged_eval = test_pdf.merge(actuals, on=["period", "region", "care_type"])
+    rmse_val = float(np.sqrt(np.mean((merged_eval["forecast_value"] - merged_eval["demand_units"]) ** 2)))
+    mape_val = float(np.mean(np.abs(
+        (merged_eval["forecast_value"] - merged_eval["demand_units"]) / merged_eval["demand_units"]
+    ))) * 100
+
+    mlflow.log_metric("mean_rmse_test", rmse_val)
+    mlflow.log_metric("mean_mape_pct_test", mape_val)
+    print(f"Hold-out RMSE: {rmse_val:.2f}  |  MAPE: {mape_val:.2f}%")
+
+    mlflow.keras.log_model(model, artifact_path="model")
+
+# COMMAND ----------
+
+# MAGIC %md ## 6. Save to Delta Table
+
+# COMMAND ----------
+
+forecast_pdf = pd.DataFrame(all_rows)
+forecast_pdf["run_timestamp"] = pd.to_datetime(forecast_pdf["run_timestamp"])
+
+schema = StructType([
+    StructField("period",         DateType(),      False),
+    StructField("region",         StringType(),    False),
+    StructField("care_type",      StringType(),    False),
+    StructField("model_name",     StringType(),    False),
+    StructField("forecast_value", DoubleType(),    False),
+    StructField("lower_bound",    DoubleType(),    True),
+    StructField("upper_bound",    DoubleType(),    True),
+    StructField("is_test_set",    BooleanType(),   False),
+    StructField("run_timestamp",  TimestampType(), False),
+    StructField("mlflow_run_id",  StringType(),    True),
+])
+
+sdf = spark.createDataFrame(forecast_pdf, schema=schema)
+spark.sql(f"DELETE FROM {FCST_TABLE} WHERE model_name = '{MODEL_NAME}'")
+sdf.write.format("delta").mode("append").saveAsTable(FCST_TABLE)
+
+print(f"Saved {sdf.count():,} forecast rows → {FCST_TABLE}")
+
+# COMMAND ----------
+
+# MAGIC %md ## 7. Training Curves & Forecast Plot
+
+# COMMAND ----------
+
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+
+# Training history
+axes[0].plot(history.history["loss"],     label="Train loss")
+axes[0].plot(history.history["val_loss"], label="Val loss")
+axes[0].set_title("Simple RNN — Training Curves")
+axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Huber Loss")
+axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+# Sample forecast
+sample_region = "South"; sample_care = "Residential Care"
+actuals_s = raw[(raw["region"] == sample_region) & (raw["care_type"] == sample_care)].copy()
+fcst_s    = forecast_pdf[(forecast_pdf["region"] == sample_region) &
+                          (forecast_pdf["care_type"] == sample_care)].copy()
+fcst_s["period"] = pd.to_datetime(fcst_s["period"])
+
+axes[1].plot(actuals_s["period"], actuals_s["demand_units"], label="Actual", color="steelblue", lw=2)
+axes[1].axvline(pd.Timestamp(TEST_START), color="grey", linestyle="--", lw=1)
+tf_s = fcst_s[fcst_s["is_test_set"] == True].sort_values("period")
+fu_s = fcst_s[fcst_s["is_test_set"] == False].sort_values("period")
+axes[1].plot(tf_s["period"], tf_s["forecast_value"], "o--", color="darkorange", label="SimpleRNN (test)")
+axes[1].fill_between(tf_s["period"], tf_s["lower_bound"], tf_s["upper_bound"], alpha=0.2, color="darkorange")
+axes[1].plot(fu_s["period"], fu_s["forecast_value"], "o-", color="firebrick", label="SimpleRNN (future)")
+axes[1].fill_between(fu_s["period"], fu_s["lower_bound"], fu_s["upper_bound"], alpha=0.2, color="firebrick")
+axes[1].set_title(f"Simple RNN — {sample_region}: {sample_care}")
+axes[1].set_xlabel("Month"); axes[1].set_ylabel("Demand"); axes[1].legend(); axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("/tmp/03_simple_rnn_forecast.png", dpi=120)
+plt.show()
+mlflow.log_artifact("/tmp/03_simple_rnn_forecast.png")
+
+print("✅ Notebook 03 complete.")
