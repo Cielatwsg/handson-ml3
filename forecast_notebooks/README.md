@@ -20,7 +20,7 @@ Inspired by **Chapter 15: Processing Sequences Using RNNs and CNNs**
 | `05_cnn_wavenet_forecast.py` | WaveNet-style dilated Conv1D + LSTM (Ch15 §"WaveNet") | ★★★★★ | TensorFlow/Keras |
 | `06_prophet_forecast.py` | Prophet — multiplicative decomposition + changepoints | ★★★☆☆ | prophet |
 | `07_evaluation.py` | Cross-model evaluation & ranking (all 6 models) | Final | MLflow / seaborn |
-| `08_survival_los_slot_forecast.ipynb` | **Survival analysis — Boys Home LOS & slot availability forecast** | ★★★☆☆ | lifelines |
+| `08_survival_los_slot_forecast.py` | **Survival analysis — Boys Home LOS & slot availability forecast** | ★★★☆☆ | lifelines |
 
 ---
 
@@ -89,8 +89,9 @@ Jan 2021 ──────────────────── Jun 2023 �
 
 ## Notebook 08 — Survival Analysis: Boys Home LOS & Slot Availability
 
-`08_survival_los_slot_forecast.ipynb` is a **standalone Jupyter notebook** (no Databricks
-required; run locally with `pip install lifelines`). It solves the **resource-planning
+`08_survival_los_slot_forecast.py` follows the same Databricks notebook format as
+notebooks 01–07 (run with `python 08_survival_los_slot_forecast.py` locally, or import
+into Databricks Repos and run as a notebook). It solves the **resource-planning
 complement** to the demand forecasts in notebooks 01–07:
 
 > *Notebooks 01–07 forecast how many new placements will be requested.*
