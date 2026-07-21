@@ -20,6 +20,7 @@ Inspired by **Chapter 15: Processing Sequences Using RNNs and CNNs**
 | `05_cnn_wavenet_forecast.py` | WaveNet-style dilated Conv1D + LSTM (Ch15 §"WaveNet") | ★★★★★ | TensorFlow/Keras |
 | `06_prophet_forecast.py` | Prophet — multiplicative decomposition + changepoints | ★★★☆☆ | prophet |
 | `07_evaluation.py` | Cross-model evaluation & ranking (all 6 models) | Final | MLflow / seaborn |
+| `08_survival_los_slot_forecast.ipynb` | **Survival analysis — Boys Home LOS & slot availability forecast** | ★★★☆☆ | lifelines |
 
 ---
 
@@ -81,6 +82,64 @@ Jan 2021 ──────────────────── Jun 2023 �
 | **sMAPE** | mean 2·\|error\|/(actual+forecast) × 100 | Symmetric MAPE, avoids asymmetry |
 | **WAPE** | Σ\|error\|/Σactual × 100 | Weighted; robust to small actual values |
 | **Bias** | mean(forecast − actual) | Positive = over-forecast, Negative = under-forecast |
+
+---
+
+---
+
+## Notebook 08 — Survival Analysis: Boys Home LOS & Slot Availability
+
+`08_survival_los_slot_forecast.ipynb` is a **standalone Jupyter notebook** (no Databricks
+required; run locally with `pip install lifelines`). It solves the **resource-planning
+complement** to the demand forecasts in notebooks 01–07:
+
+> *Notebooks 01–07 forecast how many new placements will be requested.*
+> *Notebook 08 forecasts how many slots will become available from existing placements.*
+
+### Models built
+
+| Model | Purpose |
+|---|---|
+| **Kaplan–Meier** | Non-parametric survival curve S(t) = P(still placed after t days) |
+| **Cox Proportional Hazards** | Risk factors that accelerate or delay discharge (hazard ratios) |
+| **Weibull AFT** | Parametric model for smooth extrapolation beyond observed data |
+
+### Key output: available-slot forecast
+
+For each currently active placement, the notebook computes the **conditional discharge
+probability** at t days from now:
+
+```
+P(discharge by t | still there now) = 1 − S(d + t) / S(d)
+```
+
+where `d` is the placement's current duration. Summing across all active placements per
+facility gives the expected available slots at each future week.
+
+### Connecting supply & demand
+
+```
+Available-slot forecast (notebook 08)  +  Demand forecast (notebooks 01–07)
+         │                                          │
+         └──────────────────────┬───────────────────┘
+                                ▼
+              Net available slots for new referrals per week
+```
+
+### Data schema (synthetic)
+
+```
+placements (in-memory DataFrame)
+├── home_name          STRING   — facility name
+├── capacity           INT      — total beds
+├── referral_type      STRING   — Emergency | Planned | Court Order | Step-Down
+├── age                INT      — age at admission (10–17)
+├── age_group          STRING   — 10-13 | 14-17
+├── prior_placements   INT      — prior placement count
+├── admission_date     DATE
+├── duration_days      INT      — observed days (to discharge or data cut-off)
+└── event              INT      — 1=discharged, 0=still placed (right-censored)
+```
 
 ---
 
